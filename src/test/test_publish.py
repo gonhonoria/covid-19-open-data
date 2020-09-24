@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sqlite3
 import sys
 from pathlib import Path
 from unittest import main
@@ -22,6 +23,7 @@ from pandas import DataFrame
 from lib.constants import SRC, OUTPUT_COLUMN_ADAPTER
 from lib.io import read_table, read_lines
 from lib.pipeline_tools import get_pipelines, get_schema
+
 from .profiled_test_case import ProfiledTestCase
 from publish import make_main_table, convert_tables_to_json, publish_global_tables
 

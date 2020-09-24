@@ -41,6 +41,14 @@ from lib.memory_efficient import (
     table_sort,
 )
 from lib.pipeline_tools import get_schema
+from lib.sql import (
+    create_sqlite_database,
+    table_as_csv,
+    table_import_from_file,
+    table_import_from_records,
+    table_multimerge,
+)
+from lib.sql import table_select_all
 from lib.time import date_range
 
 
@@ -145,50 +153,70 @@ def make_main_table(
             for date in date_range("2020-01-01", max_date):
                 fd.write(f"{date}\n")
 
-        # Create a temporary working table files which can be used during the steps
-        temp_file_path_1 = workdir / "tmp.1.csv"
-        temp_file_path_2 = workdir / "tmp.2.csv"
-
         # Start with all combinations of <key x date>
-        table_cross_product(keys_table_path, date_table_path, temp_file_path_1)
+        cross_product_table_path = workdir / "cross-product.csv"
+        table_cross_product(keys_table_path, date_table_path, cross_product_table_path)
 
-        # Add all the index columns to seed the main table
-        table_join(temp_file_path_1, tables_folder / "index.csv", [location_key], temp_file_path_2)
+        # Import all tables into a temporary database
+        db_temp_file = workdir / "tmp.db"
+        with create_sqlite_database(db_temp_file) as conn:
 
-        non_dated_columns = set(get_table_columns(temp_file_path_2))
-        for table_file_path in tables_folder.glob("*.csv"):
-            table_name = table_file_path.stem
+            cross_product_schema = {location_key: str, "date": str}
+            table_import_from_file(conn, cross_product_table_path, schema=cross_product_schema)
 
-            # Procede depending on whether this table should be excluded
-            if table_name in exclude_tables:
-                continue
+            # Get a list of all tables which are indexed by <key> or by <key, date>
+            schema = get_schema()
+            join_by = {"key": [], "key,date": [cross_product_table_path.stem]}
+            for table_file_path in tables_folder.glob("*.csv"):
+                table_name = table_file_path.stem
+                table_columns = get_table_columns(table_file_path)
+                table_schema = {col: schema.get(col, str) for col in table_columns}
+                table_import_from_file(
+                    conn, table_file_path, table_name=table_name, schema=table_schema
+                )
+                if "date" in table_columns:
+                    join_by["key,date"].append(table_name)
+                else:
+                    join_by["key"].append(table_name)
 
-            table_columns = get_table_columns(table_file_path)
-            if "date" in table_columns:
-                join_on = [location_key, "date"]
+            # Perform the join in 3 steps, first join all tables by key
+            table_multimerge(conn, join_by["key"], on=["key"], how="outer", into_table="_by_key")
+
+            # Next, join all the tables by <key, date>
+            table_multimerge(
+                conn,
+                join_by["key,date"],
+                on=[location_key, "date"],
+                how="full outer",
+                into_table="_by_key_date",
+            )
+
+            # Finally join the two sets of tables together
+            main_table_name = "_main_table"
+            table_multimerge(
+                conn,
+                ["_by_key", "_by_key_date"],
+                on=[location_key],
+                how="full outer",
+                into_table=main_table_name,
+            )
+
+            # TODO: avoid use of temporary files for this
+            temp_file_path_1 = workdir / "tmp.1.csv"
+            temp_file_path_2 = workdir / "tmp.1.csv"
+            table_as_csv(conn, main_table_name, temp_file_path_1)
+
+            # Drop rows with null date or without a single dated record
+            # TODO: figure out a memory-efficient way to do this
+
+            # Remove columns which provide no data because they are only null values
+            if drop_empty_columns:
+                table_drop_nan_columns(temp_file_path_1, temp_file_path_2)
             else:
-                join_on = [location_key]
+                temp_file_path_1, temp_file_path_2 = temp_file_path_2, temp_file_path_1
 
-                # Keep track of columns which are not indexed by date
-                non_dated_columns = non_dated_columns | set(table_columns)
-
-            # Iteratively perform left outer joins on all tables
-            table_join(temp_file_path_2, table_file_path, join_on, temp_file_path_1)
-
-            # Flip-flop the temp files to avoid a copy
-            temp_file_path_1, temp_file_path_2 = temp_file_path_2, temp_file_path_1
-
-        # Drop rows with null date or without a single dated record
-        # TODO: figure out a memory-efficient way to do this
-
-        # Remove columns which provide no data because they are only null values
-        if drop_empty_columns:
-            table_drop_nan_columns(temp_file_path_2, temp_file_path_1)
-        else:
-            temp_file_path_1, temp_file_path_2 = temp_file_path_2, temp_file_path_1
-
-        # Ensure that the table is appropriately sorted and write to output location
-        table_sort(temp_file_path_1, output_path)
+            # Ensure that the table is appropriately sorted and write to output location
+            table_sort(temp_file_path_1, output_path)
 
 
 def create_table_subsets(main_table_path: Path, output_path: Path) -> Iterable[Path]:
